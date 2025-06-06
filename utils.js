@@ -1,3 +1,5 @@
+const logger = require("./lib/logger");
+
 const disallowedValues = [
   '[not provided]',
   'placeholder',
@@ -25,7 +27,11 @@ const normalizePropertyName = key => key.toLowerCase().replace(/__c$/, '').repla
 
 const goal = actions => {
   // this is where the data will be written to the database
-  console.log(actions);
+  logger.info({
+    tail: actions.at(-1),
+    totalActions: actions.length,
+    // TODO: Add LOG_PREFIX to cron config
+  }, `[DB][Save]: ${actions.length} actions saved.`);
 };
 
 module.exports = {

@@ -2,8 +2,13 @@ const hubspot = require('@hubspot/api-client');
 const { queue } = require('async');
 const _ = require('lodash');
 
+const logger = require('./lib/logger');
+
 const { filterNullValuesFromObject, goal } = require('./utils');
+
 const Domain = require('./models/Domain');
+
+const LOG_PREFIX = '[CRON][Daily][DP]';
 
 const hubspotClient = new hubspot.Client({ accessToken: '' });
 const propertyPrefix = 'hubspot__';
@@ -108,7 +113,15 @@ const processCompanies = async (domain, hubId, q) => {
     const data = searchResult?.results || [];
     offsetObject.after = parseInt(searchResult?.paging?.next?.after);
 
-    console.log('fetch company batch');
+    logger.info(
+      `${LOG_PREFIX}[Companies]: Batch - ${
+        offsetObject?.after - 100 > 0
+          ? `${offsetObject?.after - 100} -`
+          : !offsetObject?.after
+          ? "Last"
+          : "0 -"
+      } ${offsetObject?.after || ""}`
+    );
 
     data.forEach(company => {
       if (!company.properties) return;
@@ -197,7 +210,15 @@ const processContacts = async (domain, hubId, q) => {
 
     const data = searchResult.results || [];
 
-    console.log('fetch contact batch');
+    logger.info(
+      `${LOG_PREFIX}[Contacts]: Batch - ${
+        offsetObject?.after - 100 > 0
+          ? `${offsetObject?.after - 100} -`
+          : !offsetObject?.after
+          ? "Last"
+          : "0 -"
+      } ${offsetObject?.after || ""}`
+    );
 
     offsetObject.after = parseInt(searchResult.paging?.next?.after);
     const contactIds = data.map(contact => contact.id);
@@ -311,7 +332,16 @@ const processMeetings = async (domain, hubId, q) => {
     if (!searchResult) throw new Error('Failed to fetch meetings for the 4th time. Aborting.');
 
     const data = searchResult.results || [];
-    console.log('fetch meeting batch');
+
+    logger.info(
+      `${LOG_PREFIX}[Meetings]: Batch - ${
+        offsetObject?.after - 100 > 0
+          ? `${offsetObject?.after - 100} -`
+          : !offsetObject?.after
+          ? "Last"
+          : "0 -"
+      } ${offsetObject?.after || ""}`
+    );
 
     // 1. Collect meeting IDs
     const meetingIds = data.map(meeting => meeting.id);
@@ -443,18 +473,24 @@ const drainQueue = async (domain, actions, q) => {
 };
 
 const pullDataFromHubspot = async () => {
-  console.log('start pulling data from HubSpot');
+  logger.info(`${LOG_PREFIX}[Start]: HubSpot`);
 
   const domain = await Domain.findOne({});
 
   for (const account of domain.integrations.hubspot.accounts) {
-    console.log('start processing account');
-    try {
-      const result = await refreshAccessToken(domain, account.hubId);
+    logger.info(`${LOG_PREFIX}[Account][Start]: HubSpot - ${account.hubId}`);
 
-      console.log(result);
+    try {
+      await refreshAccessToken(domain, account.hubId);
+
+      logger.info(`${LOG_PREFIX}: Access Token Refreshed`);
     } catch (err) {
-      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'refreshAccessToken' } });
+      logger.error({ 
+        apiKey: domain.apiKey, 
+        metadata: { operation: 'refreshAccessToken' },
+        errorMessage: err?.message,
+        errorStack: err?.stack, 
+      }, `${LOG_PREFIX}[Error]: refreshAccessToken`);
     }
 
     const actions = [];
@@ -462,36 +498,74 @@ const pullDataFromHubspot = async () => {
 
     try {
       await processContacts(domain, account.hubId, q);
-      console.log('process contacts');
+
+      logger.info(`${LOG_PREFIX}[Contacts]: Processed`);
     } catch (err) {
-      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processContacts', hubId: account.hubId } });
+      logger.error({ 
+        apiKey: domain.apiKey, 
+        metadata: { 
+          operation: 'processContacts',
+          hubId: account.hubId,
+        },
+        errorMessage: err?.message,
+        errorStack: err?.stack, 
+      }, `${LOG_PREFIX}[Error]: processContacts`);
     }
 
     try {
       await processCompanies(domain, account.hubId, q);
-      console.log('process companies');
+      
+      logger.info(`${LOG_PREFIX}[Companies]: Processed`);
     } catch (err) {
-      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+      logger.error({ 
+        apiKey: domain.apiKey, 
+        metadata: { 
+          operation: 'processCompanies',
+          hubId: account.hubId,
+        },
+        errorMessage: err?.message,
+        errorStack: err?.stack, 
+      }, `${LOG_PREFIX}[Error]: processCompanies`);
     }
 
     try {
       await processMeetings(domain, account.hubId, q);
-      console.log('process meetings');
+      
+      logger.info(`${LOG_PREFIX}[Meetings]: Processed`);
     } catch (err) {
-      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processMeetings', hubId: account.hubId } });
+      logger.error({ 
+        apiKey: domain.apiKey, 
+        metadata: { 
+          operation: 'processMeetings',
+          hubId: account.hubId,
+        },
+        errorMessage: err?.message,
+        errorStack: err?.stack, 
+      }, `${LOG_PREFIX}[Error]: processMeetings`);
     }
 
     try {
       await drainQueue(domain, actions, q);
-      console.log('drain queue');
+      
+      logger.info(`${LOG_PREFIX}[Queue]: Drained`);
     } catch (err) {
-      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'drainQueue', hubId: account.hubId } });
+      logger.error({ 
+        apiKey: domain.apiKey, 
+        metadata: { 
+          operation: 'drainQueue',
+          hubId: account.hubId,
+        },
+        errorMessage: err?.message,
+        errorStack: err?.stack, 
+      }, `${LOG_PREFIX}[Error][Queue]: drainQueue Failed`);
     }
 
     await saveDomain(domain);
 
-    console.log('finish processing account');
+    logger.info(`${LOG_PREFIX}[Account][Start]: HubSpot - ${account.hubId}`);
   }
+  
+  logger.info(`${LOG_PREFIX}[Finish]: HubSpot`);
 
   process.exit();
 };

@@ -3,6 +3,8 @@ const dotenv = require('dotenv');
 const path = require('path');
 dotenv.config({ path: path.join(__dirname, '.env') });
 
+const logger = require('./lib/logger');
+
 const { MONGO_URI } = process.env;
 
 const packageJson = require('./package.json');
@@ -21,7 +23,7 @@ mongoose
     }
   )
   .then(() => {
-    console.log('connected to database');
+    logger.info('[DB][Mongo]: Connected');
     require('./models/Domain');
 
     // worker setup
