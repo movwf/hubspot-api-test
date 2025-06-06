@@ -415,7 +415,7 @@ const createQueue = (domain, actions) => queue(async (action, callback) => {
   }
 
   callback();
-}, 100000000);
+}, 5);
 
 const drainQueue = async (domain, actions, q) => {
   if (q.length() > 0) await q.drain();
