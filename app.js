@@ -22,7 +22,7 @@ mongoose
   )
   .then(() => {
     console.log('connected to database');
-    require('./Domain');
+    require('./models/Domain');
 
     // worker setup
     require('./worker')();

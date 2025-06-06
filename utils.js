@@ -14,6 +14,7 @@ const filterNullValuesFromObject = object =>
     .fromEntries(
       Object
         .entries(object)
+        // eslint-disable-next-line no-unused-vars
         .filter(([_, v]) =>
           v !== null &&
           v !== '' &&
