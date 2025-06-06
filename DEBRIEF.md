@@ -1,3 +1,11 @@
+**Solutioning Approach**
+
+- My approach begins with thoroughly reading the needs and requirements documents to ensure alignment with business goals.
+- Recognizing that this is a sample segment of a larger analytical data ingestion pipeline—and not a final product—I prioritized delivery and stability.
+- To maintain consistency and minimize risk, I kept the implementation closely aligned with the existing codebase, especially in areas where the original logic’s intent was unclear.
+- I intentionally avoided refactoring or addressing every potential improvement at once, focusing instead on delivering the required features efficiently and without introducing unnecessary changes.
+- This approach ensures that new functionality is added with minimal disruption, while leaving room for future, more comprehensive refactoring as the product matures.
+
 **Debrief**
 
 - **Code Quality & Readability**
