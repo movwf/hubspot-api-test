@@ -428,7 +428,15 @@ const drainQueue = async (domain, actions, q) => {
   if (q.length() > 0) await q.drain();
 
   if (actions.length > 0) {
-    goal(actions)
+    try {
+      await goal(actions);
+    } catch (err) {
+      // TODO: DLQ or other implementation required for fail scenario
+      console.error('drainQueue - goal is failed:', {
+        errorMessage: err?.message,
+        errorStack: err?.stack,
+      });
+    }
   }
 
   return true;
