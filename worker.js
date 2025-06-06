@@ -411,7 +411,15 @@ const createQueue = (domain, actions) => queue(async (action, callback) => {
     const copyOfActions = _.cloneDeep(actions);
     actions.splice(0, actions.length);
 
-    goal(copyOfActions);
+    try {
+      await goal(copyOfActions);
+    } catch (err) {
+      // TODO: DLQ or other implementation required for fail scenario
+      console.error('goal is failed:', {
+        errorMessage: err?.message,
+        errorStack: err?.stack,
+      });
+    }
   }
 
   callback();
