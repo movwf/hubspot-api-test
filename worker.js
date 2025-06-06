@@ -408,11 +408,10 @@ const createQueue = (domain, actions) => queue(async (action, callback) => {
   if (actions.length > 2000) {
     console.log('inserting actions to database', { apiKey: domain.apiKey, count: actions.length });
 
-    const copyOfActions = _.cloneDeep(actions);
-    actions.splice(0, actions.length);
+    const actionsToSave = actions.splice(0, actions.length);
 
     try {
-      await goal(copyOfActions);
+      await goal(actionsToSave);
     } catch (err) {
       // TODO: DLQ or other implementation required for fail scenario
       console.error('goal is failed:', {
