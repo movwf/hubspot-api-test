@@ -90,7 +90,7 @@ const processCompanies = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 4) {
+    while (tryCount <= 3) {
       try {
         searchResult = await hubspotClient.crm.companies.searchApi.doSearch(searchObject);
         break;
@@ -181,7 +181,7 @@ const processContacts = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 4) {
+    while (tryCount <= 3) {
       try {
         searchResult = await hubspotClient.crm.contacts.searchApi.doSearch(searchObject);
         break;
@@ -297,7 +297,7 @@ const processMeetings = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 4) {
+    while (tryCount <= 3) {
       try {
         searchResult = await hubspotClient.crm.deals.searchApi.doSearch(searchObject);
         break;
