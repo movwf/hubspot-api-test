@@ -135,7 +135,6 @@ const processCompanies = async (domain, hubId, q) => {
       hasMore = false;
       break;
     } else if (offsetObject?.after >= 9900) {
-      offsetObject.after = 0;
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
   }
@@ -251,7 +250,6 @@ const processContacts = async (domain, hubId, q) => {
       hasMore = false;
       break;
     } else if (offsetObject?.after >= 9900) {
-      offsetObject.after = 0;
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
   }
@@ -393,7 +391,6 @@ const processMeetings = async (domain, hubId, q) => {
       hasMore = false;
       break;
     } else if (offsetObject?.after >= 9900) {
-      offsetObject.after = 0;
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
 
