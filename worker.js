@@ -8,10 +8,26 @@ const { filterNullValuesFromObject, goal } = require('./utils');
 
 const Domain = require('./models/Domain');
 
-const LOG_PREFIX = '[CRON][Daily][DP]';
+const CRON_CONFIG = {
+  cronName: 'DP',
+  processRetryCount: 4,
+  processBatchLimit: 100,
+  processMaxIterationPageCount: 100,
+  queueBatchSize: 2000,
+};
 
-const hubspotClient = new hubspot.Client({ accessToken: '' });
-const propertyPrefix = 'hubspot__';
+const {
+  cronName,
+  processRetryCount,
+  processBatchLimit, 
+  processMaxIterationPageCount,
+  queueBatchSize,
+} = CRON_CONFIG;
+const LOG_PREFIX = `[CRON][Daily][${cronName}]`;
+
+
+const hubspotClient = new hubspot.Client();
+
 let expirationDate;
 
 const generateLastModifiedDateFilter = (date, nowDate, propertyName = 'hs_lastmodifieddate') => {
@@ -70,7 +86,7 @@ const processCompanies = async (domain, hubId, q) => {
 
   let hasMore = true;
   const offsetObject = {};
-  const limit = 100;
+  const limit = processBatchLimit;
 
   while (hasMore) {
     const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
@@ -95,7 +111,7 @@ const processCompanies = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 3) {
+    while (tryCount < processRetryCount) {
       try {
         searchResult = await hubspotClient.crm.companies.searchApi.doSearch(searchObject);
         break;
@@ -108,15 +124,15 @@ const processCompanies = async (domain, hubId, q) => {
       }
     }
 
-    if (!searchResult) throw new Error('Failed to fetch companies for the 4th time. Aborting.');
+    if (!searchResult) throw new Error(`Failed to fetch companies for the ${processRetryCount}th time. Aborting.`);
 
     const data = searchResult?.results || [];
     offsetObject.after = parseInt(searchResult?.paging?.next?.after);
 
     logger.info(
       `${LOG_PREFIX}[Companies]: Batch - ${
-        offsetObject?.after - 100 > 0
-          ? `${offsetObject?.after - 100} -`
+        offsetObject?.after - processBatchLimit > 0
+          ? `${offsetObject?.after - processBatchLimit} -`
           : !offsetObject?.after
           ? "Last"
           : "0 -"
@@ -147,7 +163,7 @@ const processCompanies = async (domain, hubId, q) => {
     if (!offsetObject?.after) {
       hasMore = false;
       break;
-    } else if (offsetObject?.after >= 9900) {
+    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
   }
@@ -168,7 +184,7 @@ const processContacts = async (domain, hubId, q) => {
 
   let hasMore = true;
   const offsetObject = {};
-  const limit = 100;
+  const limit = processBatchLimit;
 
   while (hasMore) {
     const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
@@ -193,7 +209,7 @@ const processContacts = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 3) {
+    while (tryCount < processRetryCount) {
       try {
         searchResult = await hubspotClient.crm.contacts.searchApi.doSearch(searchObject);
         break;
@@ -206,14 +222,14 @@ const processContacts = async (domain, hubId, q) => {
       }
     }
 
-    if (!searchResult) throw new Error('Failed to fetch contacts for the 4th time. Aborting.');
+    if (!searchResult) throw new Error(`Failed to fetch contacts for the ${processRetryCount}th time. Aborting.`);
 
     const data = searchResult.results || [];
 
     logger.info(
       `${LOG_PREFIX}[Contacts]: Batch - ${
-        offsetObject?.after - 100 > 0
-          ? `${offsetObject?.after - 100} -`
+        offsetObject?.after - processBatchLimit > 0
+          ? `${offsetObject?.after - processBatchLimit} -`
           : !offsetObject?.after
           ? "Last"
           : "0 -"
@@ -270,7 +286,7 @@ const processContacts = async (domain, hubId, q) => {
     if (!offsetObject?.after) {
       hasMore = false;
       break;
-    } else if (offsetObject?.after >= 9900) {
+    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
   }
@@ -291,7 +307,7 @@ const processMeetings = async (domain, hubId, q) => {
 
   let hasMore = true;
   const offsetObject = {};
-  const limit = 100;
+  const limit = processBatchLimit;
 
   while (hasMore) {
     const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
@@ -316,7 +332,7 @@ const processMeetings = async (domain, hubId, q) => {
     let searchResult = {};
 
     let tryCount = 0;
-    while (tryCount <= 3) {
+    while (tryCount < processRetryCount) {
       try {
         searchResult = await hubspotClient.crm.deals.searchApi.doSearch(searchObject);
         break;
@@ -329,14 +345,14 @@ const processMeetings = async (domain, hubId, q) => {
       }
     }
 
-    if (!searchResult) throw new Error('Failed to fetch meetings for the 4th time. Aborting.');
+    if (!searchResult) throw new Error(`Failed to fetch meetings for the ${processRetryCount}th time. Aborting.`);
 
     const data = searchResult.results || [];
 
     logger.info(
       `${LOG_PREFIX}[Meetings]: Batch - ${
-        offsetObject?.after - 100 > 0
-          ? `${offsetObject?.after - 100} -`
+        offsetObject?.after - processBatchLimit > 0
+          ? `${offsetObject?.after - processBatchLimit} -`
           : !offsetObject?.after
           ? "Last"
           : "0 -"
@@ -420,7 +436,7 @@ const processMeetings = async (domain, hubId, q) => {
     if (!offsetObject?.after) {
       hasMore = false;
       break;
-    } else if (offsetObject?.after >= 9900) {
+    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
       offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
     }
 
@@ -435,8 +451,11 @@ const processMeetings = async (domain, hubId, q) => {
 const createQueue = (domain, actions) => queue(async (action, callback) => {
   actions.push(action);
 
-  if (actions.length > 2000) {
-    console.log('inserting actions to database', { apiKey: domain.apiKey, count: actions.length });
+  if (actions.length > queueBatchSize) {
+    logger.info({
+      apiKey: domain.apiKey,
+      count: actions.length,
+    }, `${LOG_PREFIX}[Queue]: Inserting Actions to DB`);
 
     const actionsToSave = actions.splice(0, actions.length);
 
