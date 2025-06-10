@@ -1,0 +1,12 @@
+{
+  "watch": ["**/*.js", "**/.env"],
+  "ignore": [".git", "node_modules/"],
+  "verbose": true,
+  "execMap": {
+    "js": "NODE_ENV=development node --require sucrase/register --inspect=5999"
+  },
+  "env": {
+    "NODE_ENV": "dev"
+  },
+  "ext": "js,json"
+}

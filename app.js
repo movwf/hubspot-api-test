@@ -27,7 +27,7 @@ mongoose
     require('./models/Domain');
 
     // worker setup
-    require('./worker')();
+    require('./worker2').default();
   });
 
 process.env.instance = 'app';

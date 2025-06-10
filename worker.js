@@ -1,73 +1,152 @@
-const hubspot = require('@hubspot/api-client');
-const { queue } = require('async');
-const _ = require('lodash');
+import _ from "lodash";
+import { queue } from "async";
 
-const logger = require('./lib/logger');
+import getHubspotClient from "./clients/hubspot";
 
-const { filterNullValuesFromObject, goal } = require('./utils');
+import retry from "./lib/retry";
+import logger from "./lib/logger";
+import { SearchQuery } from "./lib/hubspot";
+import { filterNullValuesFromObject, goal } from "./utils";
 
-const Domain = require('./models/Domain');
+import Domain from "./models/Domain";
+
+const { HUBSPOT_CID, HUBSPOT_CS } = process.env;
 
 const CRON_CONFIG = {
-  cronName: 'DP',
+  cronName: "DP",
   processRetryCount: 4,
+  processRetryDelay: 1500,
   processBatchLimit: 100,
   processMaxIterationPageCount: 100,
   queueBatchSize: 2000,
+  queueConcurrency: 5,
 };
 
 const {
   cronName,
   processRetryCount,
-  processBatchLimit, 
+  processRetryDelay,
+  processBatchLimit,
   processMaxIterationPageCount,
   queueBatchSize,
+  queueConcurrency,
 } = CRON_CONFIG;
 const LOG_PREFIX = `[CRON][Daily][${cronName}]`;
 
+const _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME = {
+  contacts: "lastmodifieddate",
+  companies: "hs_lastmodifieddate",
+  meetings: "hs_lastmodifieddate",
+};
 
-const hubspotClient = new hubspot.Client();
+const _SEARCH_SETTINGS_BY_OBJECT_NAME = {
+  contacts: {
+    properties: [
+      "firstname",
+      "lastname",
+      "jobtitle",
+      "email",
+      "hubspotscore",
+      "hs_lead_status",
+      "hs_analytics_source",
+      "hs_latest_source",
+    ],
+    sort: [
+      {
+        propertyName: _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME.contacts,
+        direction: "ASCENDING",
+      },
+    ],
+    associations: { from: "contacts", to: "companies" }
+  },
+  companies: {
+    properties: [
+      "name",
+      "domain",
+      "country",
+      "industry",
+      "description",
+      "annualrevenue",
+      "numberofemployees",
+      "hs_lead_status",
+    ],
+    sort: [
+      {
+        propertyName: _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME.companies,
+        direction: "ASCENDING",
+      },
+    ],
+  },
+  meetings: {
+    properties: ["hs_createdate", "hs_lastmodifieddate", "hs_object_id"],
+    sort: [
+      {
+        propertyName: _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME.meetings,
+        direction: "ASCENDING",
+      },
+    ],
+    associations: { from: "meetings", to: "contacts" },
+  },
+};
 
-let expirationDate;
-
-const generateLastModifiedDateFilter = (date, nowDate, propertyName = 'hs_lastmodifieddate') => {
+const generateLastModifiedDateFilter = (date, nowDate, objectName) => {
   const lastModifiedDateFilter = date ?
     {
       filters: [
-        { propertyName, operator: 'GTE', value: `${date.valueOf()}` },
-        { propertyName, operator: 'LTE', value: `${nowDate.valueOf()}` }
-      ]
+        {
+          propertyName:
+              _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME[objectName],
+          operator: "GTE",
+          value: `${date.valueOf()}`,
+        },
+        {
+          propertyName:
+              _LAST_MODIFIED_FILTER_PROP_NAME_BY_OBJECT_NAME[objectName],
+          operator: "LTE",
+          value: `${nowDate.valueOf()}`,
+        },
+      ],
     } :
     {};
 
   return lastModifiedDateFilter;
 };
 
-const saveDomain = async (domain) => {
+const saveDomain = async domain => {
   // disable this for testing purposes
   return;
 
-  domain.markModified('integrations.hubspot.accounts');
+  // eslint-disable-next-line no-unreachable
+  domain.markModified("integrations.hubspot.accounts");
   await domain.save();
 };
 
 /**
  * Get access token from HubSpot
+ * @param {import('@hubspot/api-client').Client} hsClient
+ * @param {import("./types").HubspotAccount} account
  */
-const refreshAccessToken = async (domain, hubId, tryCount) => {
-  const { HUBSPOT_CID, HUBSPOT_CS } = process.env;
-  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
+const refreshAccessToken = async (hsClient, account) => {
   const { accessToken, refreshToken } = account;
 
-  return hubspotClient.oauth.tokensApi
-    .createToken('refresh_token', undefined, undefined, HUBSPOT_CID, HUBSPOT_CS, refreshToken)
+  return hsClient.oauth.tokensApi
+    .create(
+      "refresh_token",
+      undefined,
+      undefined,
+      HUBSPOT_CID,
+      HUBSPOT_CS,
+      refreshToken
+    )
     .then(async result => {
       const body = result.body ? result.body : result;
 
       const newAccessToken = body.accessToken;
-      expirationDate = new Date(body.expiresIn * 1000 + new Date().getTime());
+      account.expirationDate = new Date(
+        body.expiresIn * 1000 + new Date().getTime()
+      );
 
-      hubspotClient.setAccessToken(newAccessToken);
+      hsClient.setAccessToken(newAccessToken);
       if (newAccessToken !== accessToken) {
         account.accessToken = newAccessToken;
       }
@@ -77,372 +156,297 @@ const refreshAccessToken = async (domain, hubId, tryCount) => {
 };
 
 /**
- * Get recently modified companies as 100 companies per page
+ * @typedef {{
+ *  associations: Record<string, string>,
+ *  targets: Record<string, any>,
+ * }} AssocContext
  */
-const processCompanies = async (domain, hubId, q) => {
-  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
-  const lastPulledDate = new Date(account.lastPulledDates.companies);
-  const now = new Date();
 
-  let hasMore = true;
-  const offsetObject = {};
-  const limit = processBatchLimit;
+/**
+ * Processes contacts and creates corresponding action
+ * and pushes to queue
+ * @param {import("async").QueueObject} q 
+ * @param {*} contact 
+ * @param {AssocContext} assocCtx 
+ * @param {string} lastPulledDate 
+ * @returns 
+ */
+const processContacts = (q, contact, assocCtx, lastPulledDate) => {
+  if (!contact.properties || !contact.properties.email) return;
 
-  while (hasMore) {
-    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
-    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now);
-    const searchObject = {
-      filterGroups: [lastModifiedDateFilter],
-      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
-      properties: [
-        'name',
-        'domain',
-        'country',
-        'industry',
-        'description',
-        'annualrevenue',
-        'numberofemployees',
-        'hs_lead_status'
-      ],
-      limit,
-      after: offsetObject.after
-    };
+  const companyId = assocCtx.associations[contact.id];
 
-    let searchResult = {};
-
-    let tryCount = 0;
-    while (tryCount < processRetryCount) {
-      try {
-        searchResult = await hubspotClient.crm.companies.searchApi.doSearch(searchObject);
-        break;
-      } catch (err) {
-        tryCount++;
-
-        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
-
-        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
-      }
-    }
-
-    if (!searchResult) throw new Error(`Failed to fetch companies for the ${processRetryCount}th time. Aborting.`);
-
-    const data = searchResult?.results || [];
-    offsetObject.after = parseInt(searchResult?.paging?.next?.after);
-
-    logger.info(
-      `${LOG_PREFIX}[Companies]: Batch - ${
-        offsetObject?.after - processBatchLimit > 0
-          ? `${offsetObject?.after - processBatchLimit} -`
-          : !offsetObject?.after
-          ? "Last"
-          : "0 -"
-      } ${offsetObject?.after || ""}`
-    );
-
-    data.forEach(company => {
-      if (!company.properties) return;
-
-      const actionTemplate = {
-        includeInAnalytics: 0,
-        companyProperties: {
-          company_id: company.id,
-          company_domain: company.properties.domain,
-          company_industry: company.properties.industry
-        }
-      };
-
-      const isCreated = !lastPulledDate || (new Date(company.createdAt) > lastPulledDate);
-
-      q.push({
-        actionName: isCreated ? 'Company Created' : 'Company Updated',
-        actionDate: new Date(isCreated ? company.createdAt : company.updatedAt) - 2000,
-        ...actionTemplate
-      });
-    });
-
-    if (!offsetObject?.after) {
-      hasMore = false;
-      break;
-    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
-      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
-    }
-  }
-
-  account.lastPulledDates.companies = now;
-  await saveDomain(domain);
-
-  return true;
+  
+  const userProperties = {
+    company_id: companyId,
+    contact_name: (
+      (contact.properties.firstname || "") +
+      " " +
+      (contact.properties.lastname || "")
+    ).trim(),
+    contact_title: contact.properties.jobtitle,
+    contact_source: contact.properties.hs_analytics_source,
+    contact_status: contact.properties.hs_lead_status,
+    contact_score: parseInt(contact.properties.hubspotscore) || 0,
+  };
+  
+  const actionTemplate = {
+    includeInAnalytics: 0,
+    identity: contact.properties.email,
+    userProperties: filterNullValuesFromObject(userProperties),
+  };
+  
+  const isCreated = new Date(contact.createdAt) > lastPulledDate;
+  q.push({
+    actionName: isCreated ? "Contact Created" : "Contact Updated",
+    actionDate: new Date(isCreated ? contact.createdAt : contact.updatedAt),
+    ...actionTemplate,
+  });
 };
 
 /**
- * Get recently modified contacts as 100 contacts per page
+ * Processes companies and creates corresponding action
+ * and pushes to queue
+ * @param {import("async").QueueObject} q 
+ * @param {*} contact 
+ * @param {AssocContext} assocCtx 
+ * @param {string} lastPulledDate 
+ * @returns 
  */
-const processContacts = async (domain, hubId, q) => {
-  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
-  const lastPulledDate = new Date(account.lastPulledDates.contacts);
-  const now = new Date();
+const processCompanies = (q, company, assocCtx, lastPulledDate) => {
+  if (!company.properties) return;
 
-  let hasMore = true;
-  const offsetObject = {};
-  const limit = processBatchLimit;
-
-  while (hasMore) {
-    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
-    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now, 'lastmodifieddate');
-    const searchObject = {
-      filterGroups: [lastModifiedDateFilter],
-      sorts: [{ propertyName: 'lastmodifieddate', direction: 'ASCENDING' }],
-      properties: [
-        'firstname',
-        'lastname',
-        'jobtitle',
-        'email',
-        'hubspotscore',
-        'hs_lead_status',
-        'hs_analytics_source',
-        'hs_latest_source'
-      ],
-      limit,
-      after: offsetObject.after
-    };
-
-    let searchResult = {};
-
-    let tryCount = 0;
-    while (tryCount < processRetryCount) {
-      try {
-        searchResult = await hubspotClient.crm.contacts.searchApi.doSearch(searchObject);
-        break;
-      } catch (err) {
-        tryCount++;
-
-        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
-
-        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
-      }
+  const actionTemplate = {
+    includeInAnalytics: 0,
+    companyProperties: {
+      company_id: company.id,
+      company_domain: company.properties.domain,
+      company_industry: company.properties.industry
     }
+  };
 
-    if (!searchResult) throw new Error(`Failed to fetch contacts for the ${processRetryCount}th time. Aborting.`);
-
-    const data = searchResult.results || [];
-
-    logger.info(
-      `${LOG_PREFIX}[Contacts]: Batch - ${
-        offsetObject?.after - processBatchLimit > 0
-          ? `${offsetObject?.after - processBatchLimit} -`
-          : !offsetObject?.after
-          ? "Last"
-          : "0 -"
-      } ${offsetObject?.after || ""}`
-    );
-
-    offsetObject.after = parseInt(searchResult.paging?.next?.after);
-    const contactIds = data.map(contact => contact.id);
-
-    // contact to company association
-    const contactsToAssociate = contactIds;
-    const companyAssociationsResults = (await (await hubspotClient.apiRequest({
-      method: 'post',
-      path: '/crm/v3/associations/CONTACTS/COMPANIES/batch/read',
-      body: { inputs: contactsToAssociate.map(contactId => ({ id: contactId })) }
-    })).json())?.results || [];
-
-    const companyAssociations = Object.fromEntries(companyAssociationsResults.map(a => {
-      if (a.from) {
-        contactsToAssociate.splice(contactsToAssociate.indexOf(a.from.id), 1);
-        return [a.from.id, a.to[0].id];
-      } else return false;
-    }).filter(x => x));
-
-    data.forEach(contact => {
-      if (!contact.properties || !contact.properties.email) return;
-
-      const companyId = companyAssociations[contact.id];
-
-      const isCreated = new Date(contact.createdAt) > lastPulledDate;
-
-      const userProperties = {
-        company_id: companyId,
-        contact_name: ((contact.properties.firstname || '') + ' ' + (contact.properties.lastname || '')).trim(),
-        contact_title: contact.properties.jobtitle,
-        contact_source: contact.properties.hs_analytics_source,
-        contact_status: contact.properties.hs_lead_status,
-        contact_score: parseInt(contact.properties.hubspotscore) || 0
-      };
-
-      const actionTemplate = {
-        includeInAnalytics: 0,
-        identity: contact.properties.email,
-        userProperties: filterNullValuesFromObject(userProperties)
-      };
-
-      q.push({
-        actionName: isCreated ? 'Contact Created' : 'Contact Updated',
-        actionDate: new Date(isCreated ? contact.createdAt : contact.updatedAt),
-        ...actionTemplate
-      });
-    });
-
-    if (!offsetObject?.after) {
-      hasMore = false;
-      break;
-    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
-      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
-    }
-  }
-
-  account.lastPulledDates.contacts = now;
-  await saveDomain(domain);
-
-  return true;
+  
+  const isCreated = !lastPulledDate || (new Date(company.createdAt) > lastPulledDate);
+  q.push({
+    actionName: isCreated ? 'Company Created' : 'Company Updated',
+    actionDate: new Date(isCreated ? company.createdAt : company.updatedAt) - 2000,
+    ...actionTemplate
+  });
 };
 
 /**
- * Get recently modified meetings as 100 meetings per page
+ * Processes meetings and creates corresponding action
+ * and pushes to queue
+ * @param {import("async").QueueObject} q 
+ * @param {*} contact 
+ * @param {AssocContext} assocCtx 
+ * @param {string} lastPulledDate 
+ * @returns 
  */
-const processMeetings = async (domain, hubId, q) => {
-  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
-  const lastPulledDate = new Date(account.lastPulledDates.deals);
+const processMeetings = (q, meeting, assocCtx, lastPulledDate) => {
+  if (!meeting.properties) return;
+  
+  const groupAttendeeEntries = _.groupBy(
+    Object.entries(assocCtx.associations),
+    ([key]) => key
+  );
+  
+  const attendeeIds = _.mapValues(groupAttendeeEntries, entries => entries.map(([,value]) => value));
+  
+  const attendeeList = attendeeIds[meeting.id]?.length ?
+    attendeeIds[meeting.id].map(id => ({ email: assocCtx.targets[id].email })):
+    [];
+  
+  const actionTemplate = {
+    includeInAnalytics: 0,
+    meetingProperties: {
+      meeting_id: meeting.id,
+      meeting_name: meeting.properties.name,
+      attendees: attendeeList,
+    }
+  };
+
+  const isCreated = new Date(meeting.createdAt) > lastPulledDate;
+  q.push({
+    actionName: isCreated ? "Meeting Created" : "Meeting Updated",
+    actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
+    ...actionTemplate,
+  });
+};
+
+/**
+ * Scan single object with/wo associations to process
+ * @param {import("./types").HubspotObjectName} objectName
+ * @param {import('./types').HubspotAccount} account
+ * @param {import("async").QueueObject} q
+ * @returns
+ */
+const scanObject = async (objectName, account, q) => {
+  const lastPulledDate = new Date(
+    account.lastPulledDates[objectName] ||
+      account._doc.lastPulledDates[objectName] ||
+      null
+  );
   const now = new Date();
 
+  const offsetObject = {
+    lastModifiedDate: lastPulledDate,
+    after: 0,
+  };
+
+  const hsClient = getHubspotClient({ accessToken: "" });
+  const searchQ = new SearchQuery(objectName, hsClient);
+
+  searchQ.selectProperties(
+    _SEARCH_SETTINGS_BY_OBJECT_NAME[objectName].properties
+  );
+  searchQ.addSort(_SEARCH_SETTINGS_BY_OBJECT_NAME[objectName].sort);
+  searchQ.setLimit(processBatchLimit);
+
   let hasMore = true;
-  const offsetObject = {};
-  const limit = processBatchLimit;
+  let page = 1;
 
   while (hasMore) {
-    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
-    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now);
-    const searchObject = {
-      filterGroups: [lastModifiedDateFilter],
-      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
-      properties: [
-        'dealname',
-        'amount',
-        'pipeline',
-        'dealstage',
-        'hs_lastmodifieddate',
-        'hs_createdate',
-        'createdate',
-        'closedate',
-      ],
-      limit,
-      after: offsetObject.after
-    };
+    const lastModifiedDateFilter = generateLastModifiedDateFilter(
+      offsetObject.lastModifiedDate,
+      now,
+      objectName
+    );
 
     let searchResult = {};
 
-    let tryCount = 0;
-    while (tryCount < processRetryCount) {
-      try {
-        searchResult = await hubspotClient.crm.deals.searchApi.doSearch(searchObject);
-        break;
-      } catch (err) {
-        tryCount++;
-
-        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
-
-        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+    //#region Initial Data Fetch from Hubspot
+    try {
+      if (new Date() > (account.expirationDate || 0)) {
+        await refreshAccessToken(hsClient, account);
       }
-    }
 
-    if (!searchResult) throw new Error(`Failed to fetch meetings for the ${processRetryCount}th time. Aborting.`);
+      searchResult = await retry(
+        () =>
+          searchQ
+            .replaceFilterGroups([lastModifiedDateFilter])
+            .paginate(offsetObject.after)
+            .exec(),
+        processRetryCount,
+        processRetryDelay
+      );
+    } catch (error) {
+      logger.error(error);
 
-    const data = searchResult.results || [];
-
-    logger.info(
-      `${LOG_PREFIX}[Meetings]: Batch - ${
-        offsetObject?.after - processBatchLimit > 0
-          ? `${offsetObject?.after - processBatchLimit} -`
-          : !offsetObject?.after
-          ? "Last"
-          : "0 -"
-      } ${offsetObject?.after || ""}`
-    );
-
-    // 1. Collect meeting IDs
-    const meetingIds = data.map(meeting => meeting.id);
-
-    // 2. Fetch associations: deals (meetings) to contacts
-    let meetingContactAssociations = {};
-    if (meetingIds.length > 0) {
-      const associationsResults = (await (await hubspotClient.apiRequest({
-        method: 'post',
-        path: '/crm/v3/associations/DEALS/CONTACTS/batch/read',
-        body: { inputs: meetingIds.map(id => ({ id })) }
-      })).json())?.results || [];
-      // Map: meetingId -> [contactId, ...]
-      meetingContactAssociations = Object.fromEntries(
-        associationsResults.map(a => [a.from.id, (a.to || []).map(t => t.id)])
+      throw new Error(
+        `Failed to fetch ${objectName} for the ${processRetryCount}th time. Aborting.`
       );
     }
+    //#endregion
 
-    // 3. Collect all unique contact IDs
-    const allContactIds = Array.from(new Set(Object.values(meetingContactAssociations).flat()));
-    let contactIdToEmail = {};
-    if (allContactIds.length > 0) {
-      // HubSpot batch read for contacts (max 100 per call)
-      for (let i = 0; i < allContactIds.length; i += 100) {
-        const batch = allContactIds.slice(i, i + 100);
-        const contactsResult = (await (await hubspotClient.apiRequest({
-          method: 'post',
-          path: '/crm/v3/objects/contacts/batch/read',
-          body: { properties: ['email'], inputs: batch.map(id => ({ id })) }
-        })).json())?.results || [];
-        contactsResult.forEach(contact => {
-          contactIdToEmail[contact.id] = contact.properties?.email || null;
-        });
-      }
+    const searchData = searchResult.results;
+    offsetObject.after = parseInt(searchResult.paging?.next?.after);
+
+    logger.info(
+      `${LOG_PREFIX}[${objectName}][${page}]: Batch - ${
+        offsetObject?.after - processBatchLimit > 0 ?
+          `${offsetObject?.after - processBatchLimit} -` :
+          !offsetObject?.after ?
+            "Last" :
+            "0 -"
+      } ${offsetObject?.after || ""}`
+    );
+
+    //#region Associations
+    const assocConfig = _SEARCH_SETTINGS_BY_OBJECT_NAME[objectName]?.associations;
+
+    const assocCtx = {
+      associations: {},
+      targets: {},
+    };
+
+    if (assocConfig) {
+      const objectIds = searchData.map(object => object.id);
+
+      const associationsResults = await hsClient.crm.associations.v4.batchApi.getPage(
+        assocConfig.from,
+        assocConfig.to,
+        { inputs: objectIds.map(id => ({ id })) }
+      );
+
+      assocCtx.associations = associationsResults.results.reduce((prev, assoc) => ({
+        ...prev,
+        ...assoc._from && { [assoc._from.id]: assoc.to[0].toObjectId },
+      }), {});
+
+      const targetIds = new Set(Object.values(assocCtx.associations));
+
+      const targetResults = await hsClient.crm[assocConfig.to].batchApi.read(
+        { inputs: [...targetIds.values()].map(id => ({ id })) }
+      );
+
+      assocCtx.targets = targetResults.results.reduce((prev, target) => ({
+        ...prev,
+        [target.id]: target.properties,
+      }), {});
     }
+    //#endregion
 
-    // 4. For each meeting, create an action for each associated contact (with email)
-    data.forEach(meeting => {
-      if (!meeting.properties) return;
-      const isCreated = new Date(meeting.createdAt) > lastPulledDate;
-      const meetingProps = {
-        meeting_id: meeting.id,
-        dealname: meeting.properties.dealname,
-        amount: meeting.properties.amount,
-        pipeline: meeting.properties.pipeline,
-        dealstage: meeting.properties.dealstage,
-        createdate: meeting.properties.createdate,
-        closedate: meeting.properties.closedate,
-        hs_lastmodifieddate: meeting.properties.hs_lastmodifieddate,
-        hs_createdate: meeting.properties.hs_createdate,
-      };
-      const contactIds = meetingContactAssociations[meeting.id] || [];
-      if (contactIds.length === 0) {
-        // If no contact, still push the meeting action (with no email)
-        q.push({
-          actionName: isCreated ? 'Meeting Created' : 'Meeting Updated',
-          actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
-          includeInAnalytics: 0,
-          meetingProperties: meetingProps,
-          contact_email: null
-        });
-      } else {
-        contactIds.forEach(contactId => {
-          const email = contactIdToEmail[contactId] || null;
-          q.push({
-            actionName: isCreated ? 'Meeting Created' : 'Meeting Updated',
-            actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
-            includeInAnalytics: 0,
-            meetingProperties: meetingProps,
-            contact_email: email
-          });
-        });
-      }
-    });
+    //#region Data Processing
+    for (const object of searchData) {
+      (({
+        contacts: processContacts,
+        companies: processCompanies,
+        meetings: processMeetings,
+      })[objectName])(q, object, assocCtx, lastPulledDate);
+    }
+    //#endregion
 
+    //#region Pagination
     if (!offsetObject?.after) {
       hasMore = false;
       break;
-    } else if (offsetObject?.after >= (processMaxIterationPageCount - 1) * processBatchLimit) {
-      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
+    } else if (
+      offsetObject?.after >=
+      (processMaxIterationPageCount - 1) * processBatchLimit
+    ) {
+      offsetObject.lastModifiedDate = new Date(
+        searchData[searchData.length - 1].updatedAt
+      ).valueOf();
     }
 
-    account.lastPulledDates.deals = now;
-    await saveDomain(domain);
-    console.log('fetch meeting batch');
+    page += 1;
+    //#endregion
+  }
+
+  account.lastPulledDates[objectName] = now;
+  // TODO: Pass domain
+  await saveDomain();
+
+  return true;
+};
+
+/**
+ * Process given objects
+ * @param {import("./types").HubspotObjectName} objectsList
+ * @param {string} hubId
+ * @param {import('./types').HubspotAccount} account
+ * @param {import("async").QueueObject} q
+ */
+const processObjects = async (objectsList, account, q) =>
+  Promise.all(
+    objectsList.map(objectName => scanObject(objectName, account, q))
+  );
+
+const drainQueue = async (actions, q) => {
+  if (q.length() > 0) await q.drain();
+
+  if (actions.length > 0) {
+    try {
+      await goal(actions);
+    } catch (err) {
+      // TODO: DLQ or other implementation required for fail scenario
+      console.error(`${LOG_PREFIX}[Drain-Queue][DB][Save][Error]: Faild to save to db`, {
+        errorMessage: err?.message,
+        errorStack: err?.stack,
+        count: actions.length,
+      });
+    }
   }
 
   return true;
@@ -463,130 +467,64 @@ const createQueue = (domain, actions) => queue(async (action, callback) => {
       await goal(actionsToSave);
     } catch (err) {
       // TODO: DLQ or other implementation required for fail scenario
-      console.error('goal is failed:', {
+      logger.error(`${LOG_PREFIX}[Queue][DB][Save][Error]: Faild to save to db`, {
         errorMessage: err?.message,
         errorStack: err?.stack,
+        count: actionsToSave.length,
       });
     }
   }
 
   callback();
-}, 5);
-
-const drainQueue = async (domain, actions, q) => {
-  if (q.length() > 0) await q.drain();
-
-  if (actions.length > 0) {
-    try {
-      await goal(actions);
-    } catch (err) {
-      // TODO: DLQ or other implementation required for fail scenario
-      console.error('drainQueue - goal is failed:', {
-        errorMessage: err?.message,
-        errorStack: err?.stack,
-      });
-    }
-  }
-
-  return true;
-};
+}, queueConcurrency);
 
 const pullDataFromHubspot = async () => {
-  logger.info(`${LOG_PREFIX}[Start]: HubSpot`);
+  const domain = await Domain.findOne();
 
-  const domain = await Domain.findOne({});
-
-  for (const account of domain.integrations.hubspot.accounts) {
-    logger.info(`${LOG_PREFIX}[Account][Start]: HubSpot - ${account.hubId}`);
-
-    try {
-      await refreshAccessToken(domain, account.hubId);
-
-      logger.info(`${LOG_PREFIX}: Access Token Refreshed`);
-    } catch (err) {
-      logger.error({ 
-        apiKey: domain.apiKey, 
-        metadata: { operation: 'refreshAccessToken' },
-        errorMessage: err?.message,
-        errorStack: err?.stack, 
-      }, `${LOG_PREFIX}[Error]: refreshAccessToken`);
-    }
-
+  for await (const account of domain.integrations.hubspot.accounts) {
     const actions = [];
     const q = createQueue(domain, actions);
 
     try {
-      await processContacts(domain, account.hubId, q);
+      logger.info(`${LOG_PREFIX}[Process]: Started`);
 
-      logger.info(`${LOG_PREFIX}[Contacts]: Processed`);
+      await processObjects([
+        "contacts", 
+        "companies", 
+        "meetings"
+      ], account, q);
+      
+      logger.info(`${LOG_PREFIX}[Process]: Finished`);
     } catch (err) {
-      logger.error({ 
-        apiKey: domain.apiKey, 
+      logger.error({
         metadata: { 
-          operation: 'processContacts',
+          operation: 'processObjects',
           hubId: account.hubId,
         },
         errorMessage: err?.message,
         errorStack: err?.stack, 
-      }, `${LOG_PREFIX}[Error]: processContacts`);
+      }, `${LOG_PREFIX}[Process][Error]: Failed`);
     }
 
     try {
-      await processCompanies(domain, account.hubId, q);
-      
-      logger.info(`${LOG_PREFIX}[Companies]: Processed`);
-    } catch (err) {
-      logger.error({ 
-        apiKey: domain.apiKey, 
-        metadata: { 
-          operation: 'processCompanies',
-          hubId: account.hubId,
-        },
-        errorMessage: err?.message,
-        errorStack: err?.stack, 
-      }, `${LOG_PREFIX}[Error]: processCompanies`);
-    }
+      logger.info(`${LOG_PREFIX}[Drain-Queue]: Started`);
 
-    try {
-      await processMeetings(domain, account.hubId, q);
+      await drainQueue(actions, q);
       
-      logger.info(`${LOG_PREFIX}[Meetings]: Processed`);
+      logger.info(`${LOG_PREFIX}[Drain-Queue]: Finished`);
     } catch (err) {
-      logger.error({ 
-        apiKey: domain.apiKey, 
-        metadata: { 
-          operation: 'processMeetings',
-          hubId: account.hubId,
-        },
-        errorMessage: err?.message,
-        errorStack: err?.stack, 
-      }, `${LOG_PREFIX}[Error]: processMeetings`);
-    }
-
-    try {
-      await drainQueue(domain, actions, q);
-      
-      logger.info(`${LOG_PREFIX}[Queue]: Drained`);
-    } catch (err) {
-      logger.error({ 
-        apiKey: domain.apiKey, 
+      logger.error({
         metadata: { 
           operation: 'drainQueue',
           hubId: account.hubId,
         },
         errorMessage: err?.message,
         errorStack: err?.stack, 
-      }, `${LOG_PREFIX}[Error][Queue]: drainQueue Failed`);
+      }, `${LOG_PREFIX}[Drain-Queue][Error]: Failed`);
     }
-
-    await saveDomain(domain);
-
-    logger.info(`${LOG_PREFIX}[Account][Start]: HubSpot - ${account.hubId}`);
   }
-  
-  logger.info(`${LOG_PREFIX}[Finish]: HubSpot`);
 
-  process.exit();
+  process.exit(1);
 };
 
-module.exports = pullDataFromHubspot;
+export default pullDataFromHubspot;

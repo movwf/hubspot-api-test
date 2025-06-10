@@ -6,7 +6,8 @@
       "type": "node",
       "request": "attach",
       "port": 5999,
-      "address": "localhost"
+      "address": "localhost",
+      "restart": true
     }
   ]
 }

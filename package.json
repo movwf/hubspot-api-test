@@ -5,13 +5,14 @@
   "main": "app.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint . --fix",
     "dev": "nodemon --inspect=5999 app.js",
-    "start": "node app.js"
+    "start": "node --require sucrase/register app.js"
   },
   "author": "HS",
   "license": "UNLICENSED",
   "dependencies": {
-    "@hubspot/api-client": "^8.5.0",
+    "@hubspot/api-client": "^13.0.0",
     "async": "^3.2.4",
     "body-parser": "^1.20.1",
     "cookie-parser": "^1.4.6",
@@ -24,9 +25,14 @@
     "nodemon": "^3.1.10",
     "path": "^0.12.7",
     "pino": "^9.7.0",
-    "pino-pretty": "^13.0.0"
+    "pino-pretty": "^13.0.0",
+    "sucrase": "^3.35.0"
   },
   "devDependencies": {
-    "eslint": "^8.34.0"
+    "@eslint/js": "^9.28.0",
+    "eslint": "^9.28.0",
+    "eslint-plugin-n": "^17.19.0",
+    "eslint-plugin-prefer-arrow": "^1.2.3",
+    "globals": "^16.2.0"
   }
 }

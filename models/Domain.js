@@ -1,6 +1,6 @@
 // require mongoose
-const mongoose = require('mongoose');
-const moment = require('moment');
+import mongoose from 'mongoose';
+import moment from 'moment';
 
 const Schema = mongoose.Schema;
 
@@ -76,4 +76,4 @@ const DomainSchema = new Schema({
   }
 }, { minimize: false });
 
-module.exports = mongoose.model('Domain', DomainSchema);
+export default mongoose.model('Domain', DomainSchema);
